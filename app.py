@@ -34,6 +34,7 @@ SYSTEM_PROMPT = (
 
 def db():
     if not DATABASE_URL:
+        print("DEBUG DATABASE_URL:", "VAR" if DATABASE_URL else "YOK")
         raise RuntimeError("DATABASE_URL ayarlı değil (Render Postgres bağla).")
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
