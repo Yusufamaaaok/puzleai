@@ -568,13 +568,8 @@ async function sendMessage(){
 }
 
 /** init */
-if(chats.length === 0){
-  newChat();
-}else{
-  currentChatId = chats[0].id;
-  renderHistory();
-  renderMessages();
-}
+renderHistory();
+newChat(); // her sayfa açılışında otomatik yeni sohbet aç
 </script>
 </body>
 </html>
