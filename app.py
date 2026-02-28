@@ -1,215 +1,256 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, session
 import os
 import requests
-from collections import defaultdict, deque
 from dotenv import load_dotenv
+from werkzeug.security import generate_password_hash, check_password_hash
+import psycopg2
+import psycopg2.extras
+import uuid
+from datetime import timedelta
 
 load_dotenv()
+
 API_KEY = os.getenv("API_KEY")
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
+DATABASE_URL = os.getenv("DATABASE_URL")  # Render Postgres'ten gelecek
 
 app = Flask(__name__)
+app.secret_key = SECRET_KEY
+
+# Kullanıcı siteyi kapatıp açsa da oturum devam etsin (cookie)
+app.permanent_session_lifetime = timedelta(days=30)
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL = "llama-3.1-8b-instant"
 
-# Kullanıcı başına bellek (son 16 mesaj)
-memory = defaultdict(lambda: deque(maxlen=16))
+SYSTEM_PROMPT = (
+    "Senin adın 1Puzle AI. "
+    "Asla LLaMA, Groq, OpenAI veya başka model/altyapı adı söyleme. "
+    "Kendini her zaman 1Puzle AI olarak tanıt. "
+    "Türkçe konuş. "
+    "Samimi hitapları (kral/kanka/reis) sözlük anlamıyla açıklama; gündelik konuşma gibi cevap ver. "
+    "Gereksiz tanım yapma. Net ve doğal cevap ver. "
+)
 
-# Kullanıcı profili (geçici: sunucu restart atınca sıfırlanır)
-profiles = defaultdict(lambda: {
-    "name": None,
-    "mode": "friend",   # friend | pro | teacher | coder | roast | therapist
-    "lang": "auto"      # auto | tr | en | de | fr | es | ar | ...
-})
+def db():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL ayarlı değil (Render Postgres bağla).")
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
-# Mod açıklamaları (UI’ya dokunmadan /help ile görünecek)
-MODE_HELP = {
-    "friend": "Samimi, cool, kısa ve doğal.",
-    "pro": "Daha ciddi, net, maddeli ve profesyonel.",
-    "teacher": "Öğretmen modu: adım adım anlatır, örnek verir.",
-    "coder": "Kod odaklı: kısa açıklama + temiz kod.",
-    "roast": "Eğlenceli taşlar ama hakaret/küfür yok.",
-    "therapist": "Destekleyici, sakin, yargılamaz (tıbbi teşhis yok).",
-}
+def init_db():
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        pass_hash TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS chats (
+        id UUID PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS messages (
+        id BIGSERIAL PRIMARY KEY,
+        chat_id UUID NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK (role IN ('user','assistant')),
+        content TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
 
-def client_id():
-    # Render reverse proxy: X-Forwarded-For gelebilir
-    xff = request.headers.get("X-Forwarded-For")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.remote_addr or "anon"
+init_db()
 
-def base_persona():
-    # "Benim kişiliğim" tarzı: net, cool, gereksiz sözlük yapmayan
-    return (
-        "Senin adın 1Puzle AI. "
-        "Asla LLaMA, Groq, OpenAI veya başka model/altyapı adı söyleme. "
-        "Kendini her zaman 1Puzle AI olarak tanıt. "
-        "Gündelik dili çok iyi anla: 'kral', 'kanka', 'reis' gibi hitapları sözlük anlamıyla açıklama. "
-        "Gereksiz tanım ve gereksiz uzatma yapma. "
-        "Saçmalama: emin olmadığın şeyi uydurma; gerekiyorsa 1 kısa soru sor. "
-        "Kullanıcı küfür etse bile sen küfür etme. "
-        "Cevapların doğal, modern, net olsun. "
-    )
+def current_user_id():
+    return session.get("user_id")
 
-def mode_persona(mode: str):
-    # Modlara göre ekstra davranış
-    if mode == "pro":
-        return "Daha profesyonel yaz. Gerektiğinde maddelerle. Kısa ve net."
-    if mode == "teacher":
-        return "Öğretmen gibi: adım adım, örnekli, anlaşılır. Gereksiz jargon yok."
-    if mode == "coder":
-        return "Kod odaklı yaz. Temiz kod ver. Kod bloklarını düzgün formatla. Kısa açıklama ekle."
-    if mode == "roast":
-        return "Eğlenceli taşla ama aşağılamadan, hakaret/küfür olmadan. Kısa, komik."
-    if mode == "therapist":
-        return "Destekleyici ve sakin yaz. Yargılama. Tıbbi/psikiyatrik teşhis koyma."
-    # friend default
-    return "Samimi, cool ve doğal yaz. Kısa soruya kısa, uzun soruya düzenli cevap ver."
+def ensure_login():
+    if not current_user_id():
+        return jsonify({"message": "Giriş yapmalısın."}), 401
+    return None
 
-def lang_rule(lang: str):
-    if lang == "tr":
-        return "Sadece Türkçe cevap ver."
-    if lang == "en":
-        return "Answer only in English."
-    if lang == "auto":
-        return (
-            "Kullanıcı hangi dilde yazdıysa o dilde cevap ver. "
-            "Eğer karışıksa, çoğunluk dile göre cevap ver."
-        )
-    # diğer diller için genel kural
-    return f"Kullanıcı '{lang}' dilinde yazarsa o dilde cevap ver; değilse kullanıcının dilini takip et."
-
-def system_prompt_for(user_profile: dict):
-    name = user_profile.get("name")
-    mode = user_profile.get("mode", "friend")
-    lang = user_profile.get("lang", "auto")
-
-    identity = base_persona()
-    identity += "Kullanıcı mesajı basitse basit cevap ver; teknikse teknik cevap ver. "
-
-    if name:
-        identity += f"Kullanıcının adı {name}. Uygun yerlerde ismiyle hitap edebilirsin (abartma). "
-
-    identity += "Komutlar: /help yazarsa komutları açıkla. "
-    identity += lang_rule(lang) + " "
-    identity += mode_persona(mode)
-
-    return identity
-
-def parse_command(text: str):
-    # Basit komut parser
-    t = text.strip()
-    if not t.startswith("/"):
-        return None, None
-
-    parts = t.split()
-    cmd = parts[0].lower()
-    arg = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
-
-    return cmd, arg
-
-def handle_command(cid: str, cmd: str, arg: str):
-    p = profiles[cid]
-
-    if cmd in ("/help", "/komutlar"):
-        modes_list = "\n".join([f"- {k}: {v}" for k, v in MODE_HELP.items()])
-        return (
-            "Komutlar:\n"
-            "- /mode <friend|pro|teacher|coder|roast|therapist>\n"
-            "- /lang <auto|tr|en>\n"
-            "- /name <isim>\n"
-            "- /reset (sohbet hafızasını sıfırlar)\n"
-            "- /whoami (ayarlarını gösterir)\n\n"
-            f"Modlar:\n{modes_list}"
-        )
-
-    if cmd == "/mode":
-        m = arg.lower()
-        if m not in MODE_HELP:
-            return "Geçersiz mod. Örnek: /mode coder"
-        p["mode"] = m
-        return f"Tamam 😎 Mod: **{m}** ({MODE_HELP[m]})"
-
-    if cmd == "/lang":
-        l = arg.lower()
-        if l not in ("auto", "tr", "en"):
-            return "Geçersiz dil. Örnek: /lang auto  veya  /lang tr  veya  /lang en"
-        p["lang"] = l
-        return f"Tamam ✅ Dil: **{l}**"
-
-    if cmd == "/name":
-        if not arg:
-            return "İsim ver. Örnek: /name Yusuf"
-        p["name"] = arg[:32]
-        return f"Tamam ✅ Kaydettim: **{p['name']}**"
-
-    if cmd == "/reset":
-        memory[cid].clear()
-        return "Sohbet hafızasını sıfırladım ✅"
-
-    if cmd in ("/whoami", "/me"):
-        return f"Ayarların:\n- name: {p['name']}\n- mode: {p['mode']}\n- lang: {p['lang']}"
-
-    return "Bilinmeyen komut. /help yaz."
-
-@app.route("/")
+@app.get("/")
 def index():
     return send_file("index.html")
 
-@app.route("/chat", methods=["POST"])
+# -------- AUTH --------
+
+@app.post("/auth/register")
+def register():
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip().lower()
+    password = (data.get("password") or "").strip()
+
+    if len(username) < 3 or len(username) > 20:
+        return jsonify({"message": "Username 3-20 karakter olmalı."}), 400
+    if not username.replace("_", "").isalnum():
+        return jsonify({"message": "Username sadece harf/rakam ve _ içerebilir."}), 400
+    if len(password) < 6:
+        return jsonify({"message": "Şifre en az 6 karakter olmalı."}), 400
+
+    pass_hash = generate_password_hash(password)
+
+    try:
+        conn = db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute("INSERT INTO users (username, pass_hash) VALUES (%s,%s) RETURNING id;",
+                    (username, pass_hash))
+        user_id = cur.fetchone()["id"]
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        session.permanent = True
+        session["user_id"] = user_id
+        session["username"] = username
+        return jsonify({"message": "Kayıt başarılı ✅", "username": username})
+
+    except psycopg2.errors.UniqueViolation:
+        return jsonify({"message": "Bu username alınmış."}), 409
+    except Exception as e:
+        print("REGISTER ERROR:", e)
+        return jsonify({"message": "Sunucu hatası."}), 500
+
+
+@app.post("/auth/login")
+def login():
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip().lower()
+    password = (data.get("password") or "").strip()
+
+    if not username or not password:
+        return jsonify({"message": "Username ve şifre gerekli."}), 400
+
+    try:
+        conn = db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute("SELECT id, username, pass_hash FROM users WHERE username=%s;", (username,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not row or not check_password_hash(row["pass_hash"], password):
+            return jsonify({"message": "Hatalı username veya şifre."}), 401
+
+        session.permanent = True
+        session["user_id"] = row["id"]
+        session["username"] = row["username"]
+        return jsonify({"message": "Giriş başarılı ✅", "username": row["username"]})
+
+    except Exception as e:
+        print("LOGIN ERROR:", e)
+        return jsonify({"message": "Sunucu hatası."}), 500
+
+
+@app.post("/auth/logout")
+def logout():
+    session.clear()
+    return jsonify({"message": "Çıkış yapıldı ✅"})
+
+@app.get("/auth/me")
+def me():
+    uid = current_user_id()
+    if not uid:
+        return jsonify({"logged_in": False})
+    return jsonify({"logged_in": True, "username": session.get("username")})
+
+# -------- CHAT LIFECYCLE --------
+# Yeni sohbet id'si oluştur (her site açılışında çağıracağız)
+@app.post("/chat/new")
+def chat_new():
+    err = ensure_login()
+    if err: return err
+    uid = current_user_id()
+
+    chat_id = str(uuid.uuid4())
+    try:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO chats (id, user_id, title) VALUES (%s,%s,%s);",
+                    (chat_id, uid, "Yeni Sohbet"))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"chat_id": chat_id})
+    except Exception as e:
+        print("CHAT_NEW ERROR:", e)
+        return jsonify({"message": "Sunucu hatası."}), 500
+
+
+@app.post("/chat")
 def chat():
     if not API_KEY or API_KEY == "API_KEY":
-        return jsonify({"message": "API_KEY ayarlı değil. Render/ .env içine API_KEY ekle."}), 500
+        return jsonify({"message": "API_KEY ayarlı değil. Render env'e API_KEY ekle."}), 500
+
+    err = ensure_login()
+    if err: return err
 
     data = request.get_json(silent=True) or {}
     user_message = (data.get("message") or "").strip()
+    chat_id = (data.get("chat_id") or "").strip()  # frontend gönderecek
+
     if not user_message:
         return jsonify({"message": "Bir mesaj yaz 😄"}), 400
+    if not chat_id:
+        return jsonify({"message": "chat_id yok. Önce /chat/new çağır."}), 400
 
-    cid = client_id()
-
-    # Komutlar
-    cmd, arg = parse_command(user_message)
-    if cmd:
-        reply = handle_command(cid, cmd, arg)
-        return jsonify({"message": reply})
-
-    # Bellek + sistem prompt
-    profile = profiles[cid]
-    system = system_prompt_for(profile)
-
-    history = list(memory[cid])
-    messages = [{"role": "system", "content": system}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": user_message})
-
-    payload = {
-        "model": MODEL,
-        "messages": messages,
-        "temperature": 0.85,
-        "max_tokens": 650
-    }
-
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json",
-    }
-
+    # Son 12 mesajı DB'den çek (context)
     try:
+        conn = db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute("""
+            SELECT role, content
+            FROM messages
+            WHERE chat_id=%s
+            ORDER BY id DESC
+            LIMIT 12;
+        """, (chat_id,))
+        rows = cur.fetchall()
+        rows.reverse()
+        cur.close()
+        conn.close()
+
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages += [{"role": r["role"], "content": r["content"]} for r in rows]
+        messages.append({"role": "user", "content": user_message})
+
+        payload = {
+            "model": MODEL,
+            "messages": messages,
+            "temperature": 0.85,
+            "max_tokens": 650
+        }
+        headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+
         r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=60)
         r.raise_for_status()
-        j = r.json()
-        ai_message = j["choices"][0]["message"]["content"]
+        ai_message = r.json()["choices"][0]["message"]["content"]
 
-        # Belleğe yaz
-        memory[cid].append({"role": "user", "content": user_message})
-        memory[cid].append({"role": "assistant", "content": ai_message})
+        # Mesajları DB'ye yaz
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO messages (chat_id, role, content) VALUES (%s,%s,%s);",
+                    (chat_id, "user", user_message))
+        cur.execute("INSERT INTO messages (chat_id, role, content) VALUES (%s,%s,%s);",
+                    (chat_id, "assistant", ai_message))
+        conn.commit()
+        cur.close()
+        conn.close()
 
         return jsonify({"message": ai_message})
 
     except Exception as e:
-        print("❌ SERVER ERROR ❌", e)
+        print("CHAT ERROR:", e)
         return jsonify({"message": "Sunucu hatası oluştu."}), 500
 
 
